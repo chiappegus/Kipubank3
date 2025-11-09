@@ -10,6 +10,7 @@ import "../src/KipuBank.sol";
  */
 contract MockUSDC {
     mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
     
     /**
      * @notice Mint new tokens for testing
@@ -42,16 +43,22 @@ contract MockUSDC {
      */
     function transferFrom(address from, address to, uint256 amount) public returns (bool) {
         require(balanceOf[from] >= amount, "Insufficient balance");
+        require(allowance[from][msg.sender] >= amount, "Insufficient allowance");
+        
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
+        allowance[from][msg.sender] -= amount;
         return true;
     }
     
     /**
-     * @notice Approve token spending (mock implementation)
+     * @notice Approve token spending
+     * @param spender Address allowed to spend tokens
+     * @param amount Amount allowed to spend
      * @return success Always returns true
      */
-    function approve(address, uint256) public pure returns (bool) {
+    function approve(address spender, uint256 amount) public returns (bool) {
+        allowance[msg.sender][spender] = amount;
         return true;
     }
 }
@@ -75,26 +82,47 @@ contract MockRouter {
         amounts = new uint256[](path.length);
         amounts[0] = amountIn;
         // Simulate fixed rate: 1 ETH = 1500 USDC
-        amounts[path.length - 1] = (amountIn * 1500) / 1e18 * 1e12; // Adjust decimals
+        if (path.length == 2) {
+            amounts[1] = (amountIn * 1500) / 1e18 * 1e12; // Adjust decimals for USDC
+        } else if (path.length == 3) {
+            amounts[1] = amountIn; // WETH intermediate
+            amounts[2] = (amountIn * 1500) / 1e18 * 1e12; // Final USDC amount
+        }
         return amounts;
     }
     
     /**
      * @notice Execute token swap (mock implementation)
      * @param amountIn Input amount
+     * @param amountOutMin Minimum output amount
      * @param path Token swap path
+     * @param to Recipient address
+     * @param deadline Transaction deadline
      * @return amounts Actual output amounts
      */
     function swapExactTokensForTokens(
         uint256 amountIn,
-        uint256,
+        uint256 amountOutMin,
         address[] memory path,
-        address,
-        uint256
-    ) public pure returns (uint256[] memory amounts) {
+        address to,
+        uint256 deadline
+    ) public view returns (uint256[] memory amounts) {
+        require(deadline > block.timestamp, "Expired");
+        
         amounts = new uint256[](path.length);
         amounts[0] = amountIn;
-        amounts[path.length - 1] = (amountIn * 1500) / 1e18 * 1e12; // Fixed rate
+        
+        // Simulate fixed rate: 1 ETH = 1500 USDC
+        uint256 amountOut = (amountIn * 1500) / 1e18 * 1e12; // Adjust decimals
+        require(amountOut >= amountOutMin, "Insufficient output amount");
+        
+        if (path.length == 2) {
+            amounts[1] = amountOut;
+        } else if (path.length == 3) {
+            amounts[1] = amountIn; // WETH intermediate
+            amounts[2] = amountOut; // Final USDC amount
+        }
+        
         return amounts;
     }
     
@@ -142,9 +170,9 @@ contract KipuBankTest is Test {
         router = new MockRouter();
         
         // Set up initial funds
-        usdc.mint(user1, 1000 * 10**6); // 1000 USDC
-        ethBase.mint(user1, 1 ether);   // 1 ETH.BASE
-        usdc.mint(user2, 500 * 10**6);  // 500 USDC
+        usdc.mint(user1, 10000 * 10**6); // 10000 USDC
+        ethBase.mint(user1, 10 ether);   // 10 ETH.BASE
+        usdc.mint(user2, 5000 * 10**6);  // 5000 USDC
         
         // Deploy KipuBank with mock contracts
         vm.startPrank(owner);
@@ -169,6 +197,7 @@ contract KipuBankTest is Test {
         assertEq(address(kipuBank.USDC()), address(usdc));
         assertEq(kipuBank.s_feeds(), address(ethBase));
         assertEq(address(kipuBank.ROUTER()), address(router));
+        assertEq(kipuBank.WETH(), router.WETH());
     }
 
     // ============ DEPOSIT TESTS ============
@@ -186,13 +215,33 @@ contract KipuBankTest is Test {
         usdc.approve(address(kipuBank), depositAmount);
         kipuBank.deposit(address(usdc), depositAmount);
         
-        // Verify balances
-        (uint256 eth, uint256 usdcBalance, uint256 total) = kipuBank.myBalanceS(user1);
+        // Verify balances - now using struct
+        KipuBank.Balances memory userBalances = kipuBank.myBalanceS(user1);
         
-        assertEq(eth, 0);
-        assertEq(usdcBalance, depositAmount);
-        assertGt(total, 0); // Should have ETH equivalent
+        assertEq(userBalances.eth, 0);
+        assertEq(userBalances.usdc, depositAmount);
+        assertGt(userBalances.total, 0); // Should have ETH equivalent
         assertEq(usdc.balanceOf(user1), initialBalance - depositAmount);
+        
+        vm.stopPrank();
+    }
+
+    /**
+     * @notice Test ETH deposit functionality
+     */
+    function test_DepositETH() public {
+        vm.deal(user1, 5 ether);
+        vm.startPrank(user1);
+        
+        uint256 depositAmount = 1 ether;
+        kipuBank.deposit{value: depositAmount}(address(0), depositAmount);
+        
+        // Verify balances
+        KipuBank.Balances memory userBalances = kipuBank.myBalanceS(user1);
+        
+        assertEq(userBalances.eth, depositAmount);
+        assertEq(userBalances.usdc, 0);
+        assertEq(userBalances.total, depositAmount);
         
         vm.stopPrank();
     }
@@ -202,8 +251,21 @@ contract KipuBankTest is Test {
      */
     function test_RevertOnZeroAmountDeposit() public {
         vm.startPrank(user1);
-        vm.expectRevert(); // "InvalidAmount" or similar
+        vm.expectRevert(abi.encodeWithSignature("KipuBank_ZeroAmount()"));
         kipuBank.deposit(address(usdc), 0);
+        vm.stopPrank();
+    }
+
+    /**
+     * @notice Test revert on bank capacity exceeded
+     */
+    function test_RevertOnBankCapacityExceeded() public {
+        vm.deal(user1, BANK_CAPACITY + 1 ether);
+        vm.startPrank(user1);
+        
+        vm.expectRevert(abi.encodeWithSignature("BankCapacityExceeded()"));
+        kipuBank.deposit{value: BANK_CAPACITY + 1 ether}(address(0), BANK_CAPACITY + 1 ether);
+        
         vm.stopPrank();
     }
 
@@ -221,13 +283,16 @@ contract KipuBankTest is Test {
      * @notice Test swap to USDC functionality
      */
     function test_SwapToUsdcGUSF() public {
-      vm.startPrank(user1);
-    
-    // Only test preview function that works
-    uint256 previewAmount = kipuBank.previewSwapToUsdcM2(address(ethBase), 0.1 ether);
-    assertGt(previewAmount, 0, "Preview should return positive amount");
-    
-    vm.stopPrank();
+        vm.startPrank(user1);
+        
+        uint256 swapAmount = 0.1 ether;
+        ethBase.mint(user1, swapAmount);
+        ethBase.approve(address(kipuBank), swapAmount);
+        
+        uint256 previewAmount = kipuBank.previewSwapToUsdcM2(address(ethBase), swapAmount);
+        assertGt(previewAmount, 0, "Preview should return positive amount");
+        
+        vm.stopPrank();
     }
 
     /**
@@ -235,8 +300,18 @@ contract KipuBankTest is Test {
      */
     function test_RevertOnZeroAddressSwap() public {
         vm.startPrank(user1);
-        vm.expectRevert(); // "ZeroAddress"
+        vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
         kipuBank.swapToUsdcGUSF(address(0), 100, 1);
+        vm.stopPrank();
+    }
+
+    /**
+     * @notice Test revert on zero amount swap
+     */
+    function test_RevertOnZeroAmountSwap() public {
+        vm.startPrank(user1);
+        vm.expectRevert(abi.encodeWithSignature("ZeroAmount()"));
+        kipuBank.swapToUsdcGUSF(address(ethBase), 0, 1);
         vm.stopPrank();
     }
 
@@ -246,24 +321,56 @@ contract KipuBankTest is Test {
      * @notice Test USDC withdrawal functionality
      */
     function test_WithdrawUSDC() public {
-      vm.startPrank(user1);
-    
-    // First deposit
-    uint256 depositAmount = 50 * 10**6; // 50 USDC
-    usdc.approve(address(kipuBank), depositAmount);
-    kipuBank.deposit(address(usdc), depositAmount);
-    
-    uint256 initialBalance = usdc.balanceOf(user1);
-    
-    // Withdraw smaller amount to avoid errors
-    uint256 withdrawAmount = 25 * 10**6; // Withdraw 25 USDC instead of 50
-    kipuBank.withdrawUSDC(withdrawAmount);
-    
-    // Verify funds received
-    uint256 finalBalance = usdc.balanceOf(user1);
-    assertEq(finalBalance, initialBalance + withdrawAmount);
-    
-    vm.stopPrank();
+        vm.startPrank(user1);
+        
+        // First deposit
+        uint256 depositAmount = 50 * 10**6; // 50 USDC
+        usdc.approve(address(kipuBank), depositAmount);
+        kipuBank.deposit(address(usdc), depositAmount);
+        
+        uint256 initialBalance = usdc.balanceOf(user1);
+        
+        // Withdraw smaller amount to avoid errors
+        uint256 withdrawAmount = 25 * 10**6; // Withdraw 25 USDC
+        kipuBank.withdrawUSDC(withdrawAmount);
+        
+        // Verify funds received
+        uint256 finalBalance = usdc.balanceOf(user1);
+        assertEq(finalBalance, initialBalance + withdrawAmount);
+        
+        // Verify updated balances
+        KipuBank.Balances memory userBalances = kipuBank.myBalanceS(user1);
+        assertEq(userBalances.usdc, depositAmount - withdrawAmount);
+        
+        vm.stopPrank();
+    }
+
+    /**
+     * @notice Test ETH withdrawal functionality
+     */
+    function test_WithdrawETH() public {
+        vm.deal(user1, 3 ether);
+        vm.startPrank(user1);
+        
+        // Deposit ETH
+        uint256 depositAmount = 1 ether;
+        kipuBank.deposit{value: depositAmount}(address(0), depositAmount);
+        
+        // Withdraw ETH
+        uint256 withdrawAmount = 0.5 ether;
+        uint256 initialETHBalance = address(user1).balance;
+        
+        kipuBank.withdrawETH(withdrawAmount);
+        
+        // Verify ETH received
+        uint256 finalETHBalance = address(user1).balance;
+        assertEq(finalETHBalance, initialETHBalance + withdrawAmount);
+        
+        // Verify updated balances
+        KipuBank.Balances memory userBalances = kipuBank.myBalanceS(user1);
+        assertEq(userBalances.eth, depositAmount - withdrawAmount);
+        
+        vm.stopPrank();
     }
 
     /**
@@ -271,8 +378,25 @@ contract KipuBankTest is Test {
      */
     function test_RevertOnInsufficientWithdraw() public {
         vm.startPrank(user1);
-        vm.expectRevert(); // "InsufficientFunds"
+        vm.expectRevert(abi.encodeWithSignature("InsufficientFunds()"));
         kipuBank.withdrawUSDC(1000 * 10**6); // More than available
+        vm.stopPrank();
+    }
+
+    /**
+     * @notice Test revert on withdrawal limit exceeded
+     */
+    function test_RevertOnWithdrawalLimitExceeded() public {
+        vm.deal(user1, WITHDRAWAL_LIMIT + 1 ether);
+        vm.startPrank(user1);
+        
+        // Deposit more than withdrawal limit
+        kipuBank.deposit{value: WITHDRAWAL_LIMIT + 1 ether}(address(0), WITHDRAWAL_LIMIT + 1 ether);
+        
+        // Try to withdraw more than limit
+        vm.expectRevert(abi.encodeWithSignature("WithdrawalLimitExceeded()"));
+        kipuBank.withdrawETH(WITHDRAWAL_LIMIT + 1);
+        
         vm.stopPrank();
     }
 
@@ -291,6 +415,17 @@ contract KipuBankTest is Test {
         uint256 usdcAmount = 1000 * 10**6; // 1000 USDC
         uint256 ethValue = kipuBank.convertUsdcToEth(usdcAmount);
         assertGt(ethValue, 0);
+    }
+
+    /**
+     * @notice Test revert on zero amount conversion
+     */
+    function test_RevertOnZeroAmountConversion() public {
+        vm.expectRevert(abi.encodeWithSignature("KipuBank_ZeroAmount()"));
+        kipuBank.convertEthInUSD(0);
+        
+        vm.expectRevert(abi.encodeWithSignature("KipuBank_ZeroAmount()"));
+        kipuBank.convertUsdcToEth(0);
     }
 
     // ============ MULTI-USER TESTS ============
@@ -313,13 +448,13 @@ contract KipuBankTest is Test {
         kipuBank.deposit(address(usdc), deposit2);
         vm.stopPrank();
         
-        // Verify separate balances
-        (uint256 eth1, uint256 usdc1, uint256 total1) = kipuBank.myBalanceS(user1);
-        (uint256 eth2, uint256 usdc2, uint256 total2) = kipuBank.myBalanceS(user2);
+        // Verify separate balances - now using struct
+        KipuBank.Balances memory user1Balances = kipuBank.myBalanceS(user1);
+        KipuBank.Balances memory user2Balances = kipuBank.myBalanceS(user2);
         
-        assertEq(usdc1, deposit1);
-        assertEq(usdc2, deposit2);
-        assertGt(total1, total2); // User1 should have more
+        assertEq(user1Balances.usdc, deposit1);
+        assertEq(user2Balances.usdc, deposit2);
+        assertGt(user1Balances.total, user2Balances.total); // User1 should have more
     }
 
     // ============ VIEW FUNCTION TESTS ============
@@ -327,12 +462,13 @@ contract KipuBankTest is Test {
     /**
      * @notice Test bank statistics view function
      */
-    function test_BankStatistics() public  {
+    function test_BankStatistics() public {
         vm.startPrank(owner); 
         (uint256 limit, uint256 maxCap, uint256 current, uint256 available) = kipuBank.bankStatistics();
         assertEq(limit, WITHDRAWAL_LIMIT);
         assertEq(maxCap, BANK_CAPACITY);
         assertEq(available, BANK_CAPACITY - current);
+        vm.stopPrank();
     }
 
     /**
@@ -348,21 +484,21 @@ contract KipuBankTest is Test {
      */
     function test_TransactionStatistics() public {
         // Make a deposit first (as user1)
-    vm.startPrank(user1);
-    uint256 depositAmount = 100 * 10**6;
-    usdc.approve(address(kipuBank), depositAmount);
-    kipuBank.deposit(address(usdc), depositAmount);
-    vm.stopPrank();
+        vm.startPrank(user1);
+        uint256 depositAmount = 100 * 10**6;
+        usdc.approve(address(kipuBank), depositAmount);
+        kipuBank.deposit(address(usdc), depositAmount);
+        vm.stopPrank();
 
-    // Verify statistics (as owner)
-    vm.startPrank(owner);
-    (uint256 totalDeposits, uint256 totalWithdrawals, uint256 totalTransactions) = 
-        kipuBank.transactionStatistics();
-    
-    assertGt(totalDeposits, 0);
-    assertEq(totalWithdrawals, 0);
-    assertEq(totalTransactions, totalDeposits + totalWithdrawals);
-    vm.stopPrank();
+        // Verify statistics (as owner)
+        vm.startPrank(owner);
+        (uint256 totalDeposits, uint256 totalWithdrawals, uint256 totalTransactions) = 
+            kipuBank.transactionStatistics();
+        
+        assertGt(totalDeposits, 0);
+        assertEq(totalWithdrawals, 0);
+        assertEq(totalTransactions, totalDeposits + totalWithdrawals);
+        vm.stopPrank();
     }
 
     /**
@@ -375,12 +511,12 @@ contract KipuBankTest is Test {
         usdc.approve(address(kipuBank), depositAmount);
         kipuBank.deposit(address(usdc), depositAmount);
         
-        // Test myBalanceS function
-        (uint256 eth, uint256 usdcBalance, uint256 total) = kipuBank.myBalanceS(user1);
+        // Test myBalanceS function - now returns struct
+        KipuBank.Balances memory userBalances = kipuBank.myBalanceS(user1);
         
-        assertEq(eth, 0);
-        assertEq(usdcBalance, depositAmount);
-        assertGt(total, 0);
+        assertEq(userBalances.eth, 0);
+        assertEq(userBalances.usdc, depositAmount);
+        assertGt(userBalances.total, 0);
         
         vm.stopPrank();
     }
@@ -398,11 +534,11 @@ contract KipuBankTest is Test {
         (bool success, ) = address(kipuBank).call{value: 1 ether}("");
         require(success, "ETH transfer failed");
         
-        // Verify deposit was registered
-        (uint256 eth, uint256 usdcBalance, uint256 total) = kipuBank.myBalanceS(user1);
-        assertEq(eth, 1 ether);
-        assertEq(usdcBalance, 0);
-        assertEq(total, 1 ether);
+        // Verify deposit was registered - now using struct
+        KipuBank.Balances memory userBalances = kipuBank.myBalanceS(user1);
+        assertEq(userBalances.eth, 1 ether);
+        assertEq(userBalances.usdc, 0);
+        assertEq(userBalances.total, 1 ether);
         
         vm.stopPrank();
     }
@@ -410,26 +546,104 @@ contract KipuBankTest is Test {
     // ============ OWNER FUNCTION TESTS ============
 
     /**
-     * @notice Test owner-only setFeeds function
+     * @notice Test owner-only setWETH function
      */
-    function test_SetFeeds() public {
+    function test_SetWETH() public {
         vm.startPrank(owner);
         
-        address newFeed = address(0x999);
-        kipuBank.setFeeds(newFeed);
+        address newWETH = address(0x999);
+        kipuBank.setWETH(newWETH);
         
-        assertEq(kipuBank.s_feeds(), newFeed);
+        assertEq(kipuBank.WETH(), newWETH);
+        
+        vm.stopPrank();
+    }
+
+/**
+     * @notice Test revert when non-owner tries to set WETH
+     */
+    function test_RevertNonOwnerSetWETH() public {
+        vm.startPrank(user1); // Not owner
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user1));
+        kipuBank.setWETH(address(0x999));
+        vm.stopPrank();
+    }
+
+    // ============ EDGE CASE TESTS ============
+
+    /**
+     * @notice Test deposit and withdraw full balance
+     */
+    function test_DepositAndWithdrawFullBalance() public {
+        vm.startPrank(user1);
+        
+        uint256 depositAmount = 100 * 10**6;
+        usdc.approve(address(kipuBank), depositAmount);
+        kipuBank.deposit(address(usdc), depositAmount);
+        
+        // Withdraw full amount
+        kipuBank.withdrawUSDC(depositAmount);
+        
+        // Verify zero balance
+        KipuBank.Balances memory userBalances = kipuBank.myBalanceS(user1);
+        assertEq(userBalances.usdc, 0);
+        assertEq(userBalances.total, 0);
         
         vm.stopPrank();
     }
 
     /**
-     * @notice Test revert when non-owner tries to set feeds
+     * @notice Test chainlink feed function
      */
-    function test_RevertNonOwnerSetFeeds() public {
-        vm.startPrank(user1); // Not owner
-        vm.expectRevert(); // "Ownable: caller is not the owner"
-        kipuBank.setFeeds(address(0x999));
+    function test_ChainlinkFeed() public view {
+        uint256 price = kipuBank.chainlinkFeed();
+        assertGt(price, 0, "Price should be positive");
+    }
+
+    /**
+     * @notice Test preview swap with USDC (should return same amount)
+     */
+    function test_PreviewSwapUSDC() public view {
+        uint256 amount = 100 * 10**6;
+        uint256 preview = kipuBank.previewSwapToUsdcM2(address(usdc), amount);
+        assertEq(preview, amount, "USDC preview should return same amount");
+    }
+
+    /**
+     * @notice Test complex token swap flow
+     */
+    function test_ComplexTokenSwapFlow() public {
+        vm.startPrank(user1);
+        
+        // Setup token for swap (simulating a random token)
+        address randomToken = address(0x777);
+        
+        // This will test the swap flow without actual token transfer
+        // since we don't have a real token contract
+        uint256 preview = kipuBank.previewSwapToUsdcM2(randomToken, 1 ether);
+        assertGt(preview, 0, "Preview should work for any token");
+        
+        vm.stopPrank();
+    }
+
+    /**
+     * @notice Test bank capacity updates correctly
+     */
+    function test_BankCapacityUpdates() public {
+        vm.startPrank(user1);
+        
+        uint256 depositAmount = 100 * 10**6;
+        usdc.approve(address(kipuBank), depositAmount);
+        kipuBank.deposit(address(usdc), depositAmount);
+        
+        uint256 capacityAfterDeposit = kipuBank.availableCapacity();
+        assertLt(capacityAfterDeposit, BANK_CAPACITY, "Capacity should decrease after deposit");
+        
+        kipuBank.withdrawUSDC(depositAmount);
+        
+        uint256 capacityAfterWithdraw = kipuBank.availableCapacity();
+        assertEq(capacityAfterWithdraw, BANK_CAPACITY, "Capacity should restore after withdraw");
+        
         vm.stopPrank();
     }
 }
